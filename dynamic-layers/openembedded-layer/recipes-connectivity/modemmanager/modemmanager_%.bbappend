@@ -16,4 +16,5 @@ SRC_URI:append:qcom = " \
     file://0009-sms-storage-do-hex-binary-conversion-in-sms-storage.patch \
     file://0010-sms-storage-Add-slot-info-for-TA-SMS-in-DB.patch \
     file://0001-qcom-soc-add-QRTR-MHI-based-modem-support.patch \
+    file://0001-qcom-soc-add-BAM-DMUX-data-path-support.patch \
 "

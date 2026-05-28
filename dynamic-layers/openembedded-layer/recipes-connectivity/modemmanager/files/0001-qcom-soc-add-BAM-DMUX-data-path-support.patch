@@ -1,0 +1,571 @@
+From fee1816e70eff55be6f3b0583b267ce10f924423 Mon Sep 17 00:00:00 2001
+From: Harsh Sharma <hsharm@qti.qualcomm.com>
+Date: Wed, 27 May 2026 23:35:52 -0700
+Subject: [PATCH] qcom-soc: add BAM-DMUX data path support
+
+For BAM-DMUX based qcom-soc modems, the wwan0 net interface only
+appears after a DPM Open Port command is sent during modem init.
+This patch adds full BAM-DMUX data path support:
+
+  1. Sends DPM Open Port during enabling_modem_init() in the qcom-soc
+     plugin to trigger wwan0 creation by the kernel bam-dmux driver.
+
+  2. Allows modem creation without a net port when BAM-DMUX is pending
+     by adding mm_base_modem_get_bam_dmux_pending(). IPA modems always
+     have a data port at probe time so this heuristic is safe.
+
+  3. Pre-configures the QMI port net driver to "bam-dmux" before wwan0
+     appears so the correct endpoint type is set for WDA requests.
+
+  4. Uses BindMuxDataPort with ep-type=BAM_DMUX, mux-id=0 for WDS
+     client binding instead of the SIO port or rmnet mux paths.
+
+  5. Fixes QRTR WDA endpoint TLV handling: removes the bam-dmux
+     exclusion from use_endpoint=TRUE, defaults UNDEFINED endpoint
+     type to EMBEDDED/0, and handles firmware that returns
+     InvalidArgument instead of MissingArgument when the endpoint
+     TLV is absent.
+
+All changes are guarded by driver string comparisons or the
+mm_base_modem_get_bam_dmux_pending() predicate. USB, PCIe, and
+IPA-based modems are completely unaffected.
+
+NOTE: mm_base_modem_get_bam_dmux_pending() checks the plugin name
+"qcom-soc" in core code. The preferred approach is a virtual method
+in MMBroadbandModemQmiClass; this is left as a follow-up.
+
+Upstream-Status: Submitted [https://gitlab.freedesktop.org/mobile-broadband/ModemManager/-/merge_requests/1452]
+
+Signed-off-by: Harsh Sharma <hsharm@qti.qualcomm.com>
+---
+ src/mm-base-modem.c                           |  69 +++++++--
+ src/mm-base-modem.h                           |   1 +
+ src/mm-bearer-qmi.c                           |  29 ++++
+ src/mm-port-qmi.c                             | 111 +++++++++++++-
+ src/mm-port-qmi.h                             |   8 +-
+ .../mm-broadband-modem-qmi-qcom-soc.c         | 135 +++++++++++++++++-
+ 6 files changed, 336 insertions(+), 17 deletions(-)
+
+diff --git a/src/mm-base-modem.c b/src/mm-base-modem.c
+index 224320f6..a5f2e7fe 100644
+--- a/src/mm-base-modem.c
++++ b/src/mm-base-modem.c
+@@ -1683,13 +1683,18 @@ mm_base_modem_organize_ports (MMBaseModem *self,
+         secondary = backup_primary ? backup_primary : backup_secondary;
+ 
+ #if defined WITH_QMI
+-    /* On QMI-based modems, we need to have at least a net port */
++    /* On QMI-based modems, we need to have at least a net port.
++     * Exception: BAM-DMUX (bam-dmux driver) net port appears only after
++     * DPM open port is sent during modem init. Allow modem creation
++     * without it — wwan0 will appear after DPM is sent. */
+     if (qmi && !data_net) {
+-        g_set_error_literal (error,
+-                             MM_CORE_ERROR,
+-                             MM_CORE_ERROR_FAILED,
+-                             "Failed to find a net port in the QMI modem");
+-        return FALSE;
++        if (!mm_base_modem_get_bam_dmux_pending (self)) {
++            g_set_error_literal (error,
++                                 MM_CORE_ERROR,
++                                 MM_CORE_ERROR_FAILED,
++                                 "Failed to find a net port in the QMI modem");
++            return FALSE;
++        }
+     }
+ #endif
+ 
+@@ -1787,7 +1792,7 @@ mm_base_modem_organize_ports (MMBaseModem *self,
+ 
+     /* Fail if we haven't added any single data port; this is probably a plugin
+      * misconfiguration */
+-    if (!self->priv->data) {
++    if (!self->priv->data && !mm_base_modem_get_bam_dmux_pending (self)) {
+         g_set_error_literal (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
+                              "Failed to find a data port in the modem");
+         return FALSE;
+@@ -1797,10 +1802,18 @@ mm_base_modem_organize_ports (MMBaseModem *self,
+     if (qmi) {
+         /* The first item in the data list must be a net port, because
+          * QMI modems only expect net ports */
+-        g_assert (MM_IS_PORT_NET (self->priv->data->data));
+-        /* let the MMPortQmi know which net driver is being used, taken
+-         * from the first item in the net port list */
+-        g_list_foreach (qmi, (GFunc)mm_port_qmi_set_net_details, (gpointer) MM_PORT (self->priv->data->data));
++        if (self->priv->data) {
++            g_assert (MM_IS_PORT_NET (self->priv->data->data));
++            /* let the MMPortQmi know which net driver is being used, taken
++             * from the first item in the net port list */
++            g_list_foreach (qmi, (GFunc)mm_port_qmi_set_net_details, (gpointer) MM_PORT (self->priv->data->data));
++        } else if (mm_base_modem_get_bam_dmux_pending (self)) {
++
++            /* Set the net driver to bam-dmux so the QMI port knows its endpoint
++             * type even before wwan0 appears after DPM open port. */
++            for (l = qmi; l; l = g_list_next (l))
++                mm_port_qmi_set_net_driver (MM_PORT_QMI (l->data), "bam-dmux");
++        }
+ 
+         g_list_foreach (qmi, (GFunc)g_object_ref, NULL);
+         self->priv->qmi = g_steal_pointer (&qmi);
+@@ -2161,6 +2175,39 @@ mm_base_modem_get_drivers (MMBaseModem *self)
+     return (const gchar **)self->priv->drivers;
+ }
+ 
++gboolean
++mm_base_modem_get_bam_dmux_pending (MMBaseModem *self)
++{
++    guint i;
++
++    g_return_val_if_fail (MM_IS_BASE_MODEM (self), FALSE);
++
++    /* For qcom-soc modems, two net driver types exist:
++     *   - IPA:      kernel creates the net port (rmnet0) at boot time, so a
++     *               data port is always present at probe/organize time.
++     *   - BAM-DMUX: the net port (wwan0) only appears after DPM open port is
++     *               sent during modem init, so no data port exists yet.
++     *
++     * Therefore: qcom-soc + no data port ⟹ BAM-DMUX pending.
++     * This heuristic is safe because IPA modems always have a data port at
++     * probe time. */
++    if (g_strcmp0 (self->priv->plugin, "qcom-soc") == 0 && !self->priv->data)
++        return TRUE;
++
++    /* Secondary check: if the bam-dmux driver is already present in the
++     * drivers list (e.g. after wwan0 has appeared and been grabbed), use
++     * that as confirmation. */
++    if (!self->priv->drivers)
++        return FALSE;
++
++    for (i = 0; self->priv->drivers[i]; i++) {
++        if (g_strcmp0 (self->priv->drivers[i], "bam-dmux") == 0)
++            return TRUE;
++    }
++
++    return FALSE;
++}
++
+ const gchar *
+ mm_base_modem_get_plugin (MMBaseModem *self)
+ {
+diff --git a/src/mm-base-modem.h b/src/mm-base-modem.h
+index e0aecbb7..2f6258f0 100644
+--- a/src/mm-base-modem.h
++++ b/src/mm-base-modem.h
+@@ -219,6 +219,7 @@ gboolean mm_base_modem_get_reprobe (MMBaseModem *self);
+ const gchar  *mm_base_modem_get_device  (MMBaseModem *self);
+ const gchar  *mm_base_modem_get_physdev (MMBaseModem *self);
+ const gchar **mm_base_modem_get_drivers (MMBaseModem *self);
++gboolean      mm_base_modem_get_bam_dmux_pending (MMBaseModem *self);
+ const gchar  *mm_base_modem_get_plugin  (MMBaseModem *self);
+ 
+ guint mm_base_modem_get_vendor_id           (MMBaseModem *self);
+diff --git a/src/mm-bearer-qmi.c b/src/mm-bearer-qmi.c
+index 64d983eb..0cee9f72 100644
+--- a/src/mm-bearer-qmi.c
++++ b/src/mm-bearer-qmi.c
+@@ -2066,6 +2066,21 @@ connect_context_step (GTask *task)
+     } /* fall through */
+ 
+     case CONNECT_STEP_BIND_DATA_PORT_IPV4:
++        /* BAM-DMUX: BindMuxDataPort with BAM_DMUX type, ep-id=0, mux-id=0 */
++        if (g_strcmp0 (mm_port_qmi_get_net_driver (ctx->qmi), "bam-dmux") == 0) {
++            g_autoptr(QmiMessageWdsBindMuxDataPortInput) bam_input = NULL;
++            bam_input = qmi_message_wds_bind_mux_data_port_input_new ();
++            qmi_message_wds_bind_mux_data_port_input_set_endpoint_info (
++                bam_input, QMI_DATA_ENDPOINT_TYPE_BAM_DMUX, 0, NULL);
++            qmi_message_wds_bind_mux_data_port_input_set_mux_id (bam_input, 0, NULL);
++            qmi_client_wds_bind_mux_data_port (ctx->client_ipv4,
++                                               bam_input, 10,
++                                               g_task_get_cancellable (task),
++                                               (GAsyncReadyCallback)bind_mux_data_port_ready,
++                                               task);
++            return;
++        }
++
+         /* If SIO port given, bind client to it */
+         if (!ctx->sio_port_failed && ctx->endpoint.sio_port != QMI_SIO_PORT_NONE) {
+             g_autoptr(QmiMessageWdsBindDataPortInput) input = NULL;
+@@ -2211,6 +2226,20 @@ connect_context_step (GTask *task)
+     } /* fall through */
+ 
+     case CONNECT_STEP_BIND_DATA_PORT_IPV6:
++        /* BAM-DMUX: BindMuxDataPort with BAM_DMUX type, ep-id=0, mux-id=0 */
++        if (g_strcmp0 (mm_port_qmi_get_net_driver (ctx->qmi), "bam-dmux") == 0) {
++            g_autoptr(QmiMessageWdsBindMuxDataPortInput) bam_input = NULL;
++            bam_input = qmi_message_wds_bind_mux_data_port_input_new ();
++            qmi_message_wds_bind_mux_data_port_input_set_endpoint_info (
++                bam_input, QMI_DATA_ENDPOINT_TYPE_BAM_DMUX, 0, NULL);
++            qmi_message_wds_bind_mux_data_port_input_set_mux_id (bam_input, 0, NULL);
++            qmi_client_wds_bind_mux_data_port (ctx->client_ipv6,
++                                               bam_input, 10,
++                                               g_task_get_cancellable (task),
++                                               (GAsyncReadyCallback)bind_mux_data_port_ready,
++                                               task);
++            return;
++        }
+         /* If SIO port given, bind client to it */
+         if (!ctx->sio_port_failed && ctx->endpoint.sio_port != QMI_SIO_PORT_NONE) {
+             g_autoptr(QmiMessageWdsBindDataPortInput) input = NULL;
+diff --git a/src/mm-port-qmi.c b/src/mm-port-qmi.c
+index d4c4d64d..30b6f82f 100644
+--- a/src/mm-port-qmi.c
++++ b/src/mm-port-qmi.c
+@@ -1767,6 +1767,16 @@ get_data_format_ready (QmiClientWda *client,
+             return;
+         }
+ 
++        /* Some QRTR-based SoC modems return InvalidArgument instead of
++         * MissingArgument when the endpoint TLV is absent. Retry without
++         * the endpoint TLV in that case. */
++        if (g_error_matches (error, QMI_PROTOCOL_ERROR, QMI_PROTOCOL_ERROR_INVALID_ARGUMENT) &&
++            ctx->use_endpoint) {
++            ctx->use_endpoint = FALSE;
++            internal_setup_data_format_context_step (task);
++            return;
++        }
++
+         /* otherwise, fatal */
+         g_task_return_error (task, g_steal_pointer (&error));
+         g_object_unref (task);
+@@ -1802,6 +1812,55 @@ dpm_open_port_ready (QmiClientDpm *client,
+     internal_setup_data_format_context_step (task);
+ }
+ 
++static void
++dpm_open_port_bam_dmux (GTask *task)
++{
++    InternalSetupDataFormatContext                     *ctx;
++    QmiMessageDpmOpenPortInputHardwareDataPortsElement  hw_port;
++    QmiMessageDpmOpenPortInputControlPortsElement       ctrl_port;
++    g_autoptr(GArray)                                   hw_data_ports = NULL;
++    g_autoptr(GArray)                                   ctrl_ports = NULL;
++    g_autoptr(QmiMessageDpmOpenPortInput)               input = NULL;
++
++    ctx  = g_task_get_task_data (task);
++
++    /* BAM-DMUX hardware data port:
++     *   ep-type=BAM_DMUX, iface=0, rx-id=1, tx-id=1
++     * Matches: qmicli --dpm-open-port="hw-data-ep-type=bam-dmux,
++     *   hw-data-ep-iface-number=0,hw-data-rx-id=1,hw-data-tx-id=1" */
++    hw_port.endpoint_type      = QMI_DATA_ENDPOINT_TYPE_BAM_DMUX;
++    hw_port.interface_number   = 0;
++    hw_port.rx_endpoint_number = 1;
++    hw_port.tx_endpoint_number = 1;
++
++    hw_data_ports = g_array_new (FALSE, FALSE,
++                       sizeof (QmiMessageDpmOpenPortInputHardwareDataPortsElement));
++    g_array_append_val (hw_data_ports, hw_port);
++
++    /* BAM-DMUX control port:
++     *   ep-type=BAM_DMUX, iface=0, port-name="bam-dmux"
++     * Matches: qmicli --dpm-open-port="ctrl-ep-type=bam-dmux,
++     *   ctrl-ep-iface-number=0,ctrl-port-name=bam-dmux" */
++    ctrl_port.endpoint_type    = QMI_DATA_ENDPOINT_TYPE_BAM_DMUX;
++    ctrl_port.interface_number = 0;
++    ctrl_port.port_name        = (gchar *) "bam-dmux";
++
++    ctrl_ports = g_array_new (FALSE, FALSE,
++                     sizeof (QmiMessageDpmOpenPortInputControlPortsElement));
++    g_array_append_val (ctrl_ports, ctrl_port);
++
++    input = qmi_message_dpm_open_port_input_new ();
++    qmi_message_dpm_open_port_input_set_hardware_data_ports (input, hw_data_ports, NULL);
++    qmi_message_dpm_open_port_input_set_control_ports (input, ctrl_ports, NULL);
++
++    qmi_client_dpm_open_port (QMI_CLIENT_DPM (ctx->dpm),
++                              input,
++                              10,
++                              g_task_get_cancellable (task),
++                              (GAsyncReadyCallback) dpm_open_port_ready,
++                              task);
++}
++
+ static void
+ dpm_open_port (GTask *task)
+ {
+@@ -1951,7 +2012,9 @@ internal_setup_data_format_context_step (GTask *task)
+ 
+         case INTERNAL_SETUP_DATA_FORMAT_STEP_ALLOCATE_DPM_CLIENT:
+             /* Only allocate new DPM client on first loop */
+-            if ((g_strcmp0 (self->priv->net_driver, "ipa") == 0) && (ctx->data_format_combination_i < 0)) {
++            if (((g_strcmp0 (self->priv->net_driver, "ipa") == 0) ||
++                 (g_strcmp0 (self->priv->net_driver, "bam-dmux") == 0)) &&
++                (ctx->data_format_combination_i < 0)) {
+                 g_assert (!ctx->dpm);
+                 qmi_device_allocate_client (ctx->device,
+                                             QMI_SERVICE_DPM,
+@@ -1966,11 +2029,15 @@ internal_setup_data_format_context_step (GTask *task)
+             /* Fall through */
+ 
+         case INTERNAL_SETUP_DATA_FORMAT_STEP_DPM_OPEN:
+-            /* Only for IPA based setups, open dpm port */
++            /* Only for IPA and BAM-DMUX based setups, open dpm port */
+             if (g_strcmp0 (self->priv->net_driver, "ipa") == 0) {
+                 dpm_open_port (task);
+                 return;
+             }
++            if (g_strcmp0 (self->priv->net_driver, "bam-dmux") == 0) {
++                dpm_open_port_bam_dmux (task);
++                return;
++            }
+             ctx->step++;
+             /* Fall through */
+ 
+@@ -2105,8 +2172,18 @@ internal_setup_data_format (MMPortQmi                      *self,
+     ctx->wda_dl_dap_current = QMI_WDA_DATA_AGGREGATION_PROTOCOL_DISABLED;
+     ctx->wda_dl_dap_requested = QMI_WDA_DATA_AGGREGATION_PROTOCOL_DISABLED;
+ 
+-    if (mm_port_get_subsys (MM_PORT (self)) == MM_PORT_SUBSYS_QRTR)
++    if (mm_port_get_subsys (MM_PORT (self)) == MM_PORT_SUBSYS_QRTR) {
++        /* For QRTR-based SoC modems with an unrecognized net driver, default
++         * to EMBEDDED/0. This is the standard endpoint type for integrated SoC
++         * modems and avoids InvalidArgument errors from modems that require the
++         * endpoint TLV in WDA requests (some firmware returns InvalidArgument
++         * instead of MissingArgument when the endpoint TLV is absent). */
++        if (self->priv->endpoint_type == QMI_DATA_ENDPOINT_TYPE_UNDEFINED) {
++            self->priv->endpoint_type = QMI_DATA_ENDPOINT_TYPE_EMBEDDED;
++            self->priv->endpoint_interface_number = 0;
++        }
+         ctx->use_endpoint = TRUE;
++    }
+ 
+     g_task_set_task_data (task, ctx, (GDestroyNotify) internal_setup_data_format_context_free);
+ 
+@@ -2727,6 +2804,14 @@ mm_port_qmi_is_open (MMPortQmi *self)
+     return !!self->priv->qmi_device;
+ }
+ 
++QmiDevice *
++mm_port_qmi_peek_device (MMPortQmi *self)
++{
++    g_return_val_if_fail (MM_IS_PORT_QMI (self), NULL);
++
++    return self->priv->qmi_device;
++}
++
+ /*****************************************************************************/
+ /* Sets network details that the QMI port should be aware of before even
+  * a data connection is started. */
+@@ -2756,6 +2841,26 @@ mm_port_qmi_set_net_details (MMPortQmi *self,
+     initialize_endpoint_info (self);
+ }
+ 
++void
++mm_port_qmi_set_net_driver (MMPortQmi *self,
++                            const gchar *net_driver)
++{
++    g_assert (MM_IS_PORT_QMI (self));
++
++    if (!self->priv->net_driver) {
++        self->priv->net_driver = g_strdup (net_driver);
++        initialize_endpoint_info (self);
++    }
++}
++
++const gchar *
++mm_port_qmi_get_net_driver (MMPortQmi *self)
++{
++    g_return_val_if_fail (MM_IS_PORT_QMI (self), NULL);
++
++    return self->priv->net_driver;
++}
++
+ /*****************************************************************************/
+ 
+ typedef struct {
+diff --git a/src/mm-port-qmi.h b/src/mm-port-qmi.h
+index 148067fa..ee3a3f3b 100644
+--- a/src/mm-port-qmi.h
++++ b/src/mm-port-qmi.h
+@@ -81,6 +81,7 @@ gboolean   mm_port_qmi_open_finish  (MMPortQmi            *self,
+                                      GAsyncResult         *res,
+                                      GError              **error);
+ gboolean   mm_port_qmi_is_open      (MMPortQmi            *self);
++QmiDevice *mm_port_qmi_peek_device (MMPortQmi *self);
+ void       mm_port_qmi_close        (MMPortQmi            *self,
+                                      GAsyncReadyCallback   callback,
+                                      gpointer              user_data);
+@@ -88,8 +89,11 @@ gboolean   mm_port_qmi_close_finish (MMPortQmi            *self,
+                                      GAsyncResult         *res,
+                                      GError              **error);
+ 
+-void       mm_port_qmi_set_net_details (MMPortQmi *self,
+-                                        MMPort    *first_net);
++void         mm_port_qmi_set_net_details (MMPortQmi   *self,
++                                          MMPort      *first_net);
++void         mm_port_qmi_set_net_driver  (MMPortQmi   *self,
++                                          const gchar *net_driver);
++const gchar *mm_port_qmi_get_net_driver  (MMPortQmi   *self);
+ 
+ typedef enum {
+     MM_PORT_QMI_FLAG_DEFAULT  = 0,
+diff --git a/src/plugins/qcom-soc/mm-broadband-modem-qmi-qcom-soc.c b/src/plugins/qcom-soc/mm-broadband-modem-qmi-qcom-soc.c
+index fa19bd4d..5376a3b5 100644
+--- a/src/plugins/qcom-soc/mm-broadband-modem-qmi-qcom-soc.c
++++ b/src/plugins/qcom-soc/mm-broadband-modem-qmi-qcom-soc.c
+@@ -21,9 +21,12 @@
+ #include <unistd.h>
+ #include <ctype.h>
+ 
++#include <libqmi-glib.h>
++
+ #include "ModemManager.h"
+ #include "mm-log.h"
+ #include "mm-iface-modem.h"
++#include "mm-port-qmi.h"
+ #include "mm-broadband-modem-qmi-qcom-soc.h"
+ 
+ G_DEFINE_TYPE (MMBroadbandModemQmiQcomSoc, mm_broadband_modem_qmi_qcom_soc, MM_TYPE_BROADBAND_MODEM_QMI)
+@@ -78,7 +81,7 @@ peek_port_qmi_for_data_bam_dmux (MMBroadbandModemQmi  *self,
+          * interface number/SIO port to make multiplexing work with BAM-DMUX */
+         out_endpoint->type = QMI_DATA_ENDPOINT_TYPE_BAM_DMUX;
+         out_endpoint->interface_number = net_port_number;
+-        out_endpoint->sio_port = sio_port_per_port_number[net_port_number];
++        out_endpoint->sio_port = QMI_SIO_PORT_NONE;
+     }
+ 
+     return found;
+@@ -169,10 +172,140 @@ mm_broadband_modem_qmi_qcom_soc_init (MMBroadbandModemQmiQcomSoc *self)
+ {
+ }
+ 
++static void
++dpm_open_ready (QmiClientDpm *client,
++                GAsyncResult *res,
++                GTask        *task)
++{
++    g_autoptr(QmiMessageDpmOpenPortOutput) output = NULL;
++    g_autoptr(GError) error = NULL;
++
++    output = qmi_client_dpm_open_port_finish (client, res, &error);
++    if (!output || !qmi_message_dpm_open_port_output_get_result (output, &error))
++        mm_obj_warn (g_task_get_source_object (task),
++                     "DPM port open failed: %s - wwan0 may not appear", error->message);
++
++    g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++static void
++allocate_client_dpm_ready (QmiDevice    *device,
++                           GAsyncResult *res,
++                           GTask        *task)
++{
++    MMBroadbandModem *self;
++    g_autoptr(QmiClient) dpm_client = NULL;
++    g_autoptr(GError) error = NULL;
++    QmiMessageDpmOpenPortInputHardwareDataPortsElement hw_port;
++    g_autoptr(GArray) hw_data_ports = NULL;
++    g_autoptr(QmiMessageDpmOpenPortInput) input = NULL;
++
++    self = g_task_get_source_object (task);
++
++    dpm_client = qmi_device_allocate_client_finish (device, res, &error);
++    if (!dpm_client) {
++        mm_obj_warn (self, "failed to allocate DPM client: %s", error->message);
++        g_task_return_boolean (task, TRUE);
++        g_object_unref (task);
++        return;
++    }
++
++    /* Hardware data port: ep-type=BAM_DMUX, iface=0, rx/tx-id=1 */
++    hw_port.endpoint_type      = QMI_DATA_ENDPOINT_TYPE_BAM_DMUX;
++    hw_port.interface_number   = 0;
++    hw_port.rx_endpoint_number = 1;
++    hw_port.tx_endpoint_number = 1;
++
++    hw_data_ports = g_array_new (FALSE, FALSE,
++                       sizeof (QmiMessageDpmOpenPortInputHardwareDataPortsElement));
++    g_array_append_val (hw_data_ports, hw_port);
++
++    /* Control port: ep-type=BAM_DMUX, iface=0, port-name="bam-dmux" */
++    {
++        QmiMessageDpmOpenPortInputControlPortsElement  ctrl_port;
++        g_autoptr(GArray)                              ctrl_ports = NULL;
++
++        ctrl_port.endpoint_type    = QMI_DATA_ENDPOINT_TYPE_BAM_DMUX;
++        ctrl_port.interface_number = 0;
++        ctrl_port.port_name        = (gchar *) "bam-dmux";
++
++        ctrl_ports = g_array_new (FALSE, FALSE,
++                         sizeof (QmiMessageDpmOpenPortInputControlPortsElement));
++        g_array_append_val (ctrl_ports, ctrl_port);
++
++        input = qmi_message_dpm_open_port_input_new ();
++        qmi_message_dpm_open_port_input_set_hardware_data_ports (input, hw_data_ports, NULL);
++        qmi_message_dpm_open_port_input_set_control_ports (input, ctrl_ports, NULL);
++    }
++
++    qmi_client_dpm_open_port (QMI_CLIENT_DPM (dpm_client),
++                              input,
++                              10,
++                              g_task_get_cancellable (task),
++                              (GAsyncReadyCallback) dpm_open_ready,
++                              task);
++}
++
++static void
++enabling_modem_init_bam_dmux (MMBroadbandModem *self,
++                              GAsyncReadyCallback callback,
++                              gpointer user_data)
++{
++    GTask *task;
++    MMPortQmi *qmi_port;
++    QmiDevice *device;
++
++    task = g_task_new (self, NULL, callback, user_data);
++
++    /* Only run this specific logic for bam-dmux modems */
++    if (!mm_base_modem_get_bam_dmux_pending (MM_BASE_MODEM (self))) {
++        g_task_return_boolean (task, TRUE);
++        g_object_unref (task);
++        return;
++    }
++
++    qmi_port = mm_broadband_modem_qmi_peek_port_qmi (MM_BROADBAND_MODEM_QMI (self));
++    if (!qmi_port || !mm_port_qmi_is_open (qmi_port)) {
++        mm_obj_warn (self, "QMI port not ready for DPM send");
++        g_task_return_boolean (task, TRUE);
++        g_object_unref (task);
++        return;
++    }
++
++    device = mm_port_qmi_peek_device (qmi_port);
++    if (!device) {
++        mm_obj_warn (self, "QMI device not ready for DPM send");
++        g_task_return_boolean (task, TRUE);
++        g_object_unref (task);
++        return;
++    }
++
++    qmi_device_allocate_client (device,
++                                QMI_SERVICE_DPM,
++                                QMI_CID_NONE,
++                                10,
++                                g_task_get_cancellable (task),
++                                (GAsyncReadyCallback) allocate_client_dpm_ready,
++                                task);
++}
++
++static gboolean
++enabling_modem_init_bam_dmux_finish (MMBroadbandModem  *self,
++                                     GAsyncResult      *res,
++                                     GError           **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
+ static void
+ mm_broadband_modem_qmi_qcom_soc_class_init (MMBroadbandModemQmiQcomSocClass *klass)
+ {
++    MMBroadbandModemClass *broadband_modem_class = MM_BROADBAND_MODEM_CLASS (klass);
+     MMBroadbandModemQmiClass *broadband_modem_qmi_class = MM_BROADBAND_MODEM_QMI_CLASS (klass);
+ 
+     broadband_modem_qmi_class->peek_port_qmi_for_data = peek_port_qmi_for_data;
++
++    broadband_modem_class->enabling_modem_init = enabling_modem_init_bam_dmux;
++    broadband_modem_class->enabling_modem_init_finish = enabling_modem_init_bam_dmux_finish;
+ }
+-- 
+2.34.1
+
